@@ -128,6 +128,104 @@ def eval_model(args):
     print(outputs)
 
 
+def eval_model_load_only(args):
+    disable_torch_init()
+
+    model_name = get_model_name_from_path(args.model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        args.model_path, args.model_base, model_name
+    )
+
+    info_dict = {
+        "model_name": model_name,
+        "tokenizer": tokenizer,
+        "model": model,
+        "image_processor": image_processor,
+        "context_len": context_len
+    }
+
+    return info_dict
+
+def eval_model_prompt_process_only(args, model_info_dict):
+    qs = args.query
+    image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+    if IMAGE_PLACEHOLDER in qs:
+        if model_info_dict["model"].config.mm_use_im_start_end:
+            qs = re.sub(IMAGE_PLACEHOLDER, image_token_se, qs)
+        else:
+            qs = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, qs)
+    else:
+        if model_info_dict["model"].config.mm_use_im_start_end:
+            qs = image_token_se + "\n" + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
+
+    if "llama-2" in model_info_dict["model_name"].lower():
+        conv_mode = "llava_llama_2"
+    elif "mistral" in model_info_dict["model_name"].lower():
+        conv_mode = "mistral_instruct"
+    elif "v1.6-34b" in model_info_dict["model_name"].lower():
+        conv_mode = "chatml_direct"
+    elif "v1" in model_info_dict["model_name"].lower():
+        conv_mode = "llava_v1"
+    elif "mpt" in model_info_dict["model_name"].lower():
+        conv_mode = "mpt"
+    else:
+        conv_mode = "llava_v0"
+
+    if args.conv_mode is not None and conv_mode != args.conv_mode:
+        print(
+            "[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}".format(
+                conv_mode, args.conv_mode, args.conv_mode
+            )
+        )
+    else:
+        args.conv_mode = conv_mode
+
+    conv = conv_templates[args.conv_mode].copy()
+    conv.append_message(conv.roles[0], qs)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+
+    input_ids = (
+        tokenizer_image_token(prompt, model_info_dict["tokenizer"], IMAGE_TOKEN_INDEX, return_tensors="pt")
+        .unsqueeze(0)
+        .cuda()
+    )
+
+    model_info_dict["input_ids"] = input_ids
+
+    return args, model_info_dict
+
+def eval_model_image_process_only(args, model_info_dict):
+    image_files = image_parser(args)
+    images = load_images(image_files)
+    image_sizes = [x.size for x in images]
+    images_tensor = process_images(
+        images,
+        model_info_dict["image_processor"],
+        model_info_dict["model"].config
+    ).to(model_info_dict["model"].device, dtype=torch.float16)
+
+    with torch.inference_mode():
+        output_ids = model_info_dict["model"].generate(
+            model_info_dict["input_ids"],
+            images=images_tensor,
+            image_sizes=image_sizes,
+            do_sample=True if args.temperature > 0 else False,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
+            use_cache=True,
+        )
+
+    outputs = model_info_dict["tokenizer"].batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    # empty cuda cache
+    torch.cuda.empty_cache()
+    return outputs
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
